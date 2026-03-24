@@ -1,0 +1,207 @@
+from pyspark.sql import functions as F
+from delta.tables import DeltaTable
+
+spark.sql("USE cctb_catalog.ufo_dw")
+print("Environment ready — Silver layer")
+
+# Load the Bronze Delta table and register it as a TempView for SparkSQL
+df_bronze = spark.sql("SELECT * FROM cctb_catalog.ufo_dw.bronze_ufo_sightings")
+df_bronze.createOrReplaceTempView("v_bronze")
+
+print(f"Bronze rows loaded: {df_bronze.count():,}")
+
+# Assess data quality issues before applying transformations
+spark.sql("""
+    SELECT
+        COUNT(*)                                                   AS total_rows,
+        SUM(CASE WHEN Country  IS NULL THEN 1 ELSE 0 END)          AS null_country,
+        SUM(CASE WHEN UFO_shape IS NULL THEN 1 ELSE 0 END)         AS null_shape,
+        SUM(CASE WHEN Hour IS NULL THEN 1 ELSE 0 END)              AS null_hour,
+        SUM(CASE WHEN length_of_encounter_seconds IS NULL
+                   OR length_of_encounter_seconds <= 0
+                 THEN 1 ELSE 0 END)                                AS invalid_duration
+    FROM v_bronze
+""").display()
+
+# Build the Silver DataFrame using SparkSQL transformations
+# Each transformation decision is documented inline
+df_silver_new = spark.sql("""
+    SELECT
+        -- Control key inherited from Bronze (used as MERGE join condition)
+        _row_hash,
+
+        -- ── Temporal Fields ────────────────────────────────────────────────
+        -- TRY_TO_TIMESTAMP: returns NULL on parse failure instead of throwing an error
+        TRY_TO_TIMESTAMP(Date_time, 'yyyy-MM-dd HH:mm:ss')       AS event_timestamp,
+        -- TRY_TO_DATE: handles mixed formats gracefully
+        TRY_TO_DATE(date_documented, 'M/d/yyyy')                  AS date_documented,
+        CAST(Year  AS INT)                                        AS year,
+        CAST(Month AS INT)                                        AS month,
+        CAST(Hour  AS INT)                                        AS hour,
+        TRIM(Season)                                              AS season,
+
+        -- ── Location Fields ────────────────────────────────────────────────
+        -- UPPER ensures country codes are consistent for joins (e.g. 'us' = 'US')
+        UPPER(TRIM(Country_Code))                                 AS country_code,
+        -- INITCAP standardises capitalisation (e.g. 'united states' → 'United States')
+        INITCAP(TRIM(Country))                                    AS country,
+        TRIM(Region)                                              AS region,
+        TRIM(Locale)                                              AS locale,
+        -- ROUND(4) reduces floating-point noise in coordinates
+        ROUND(CAST(latitude   AS DOUBLE), 4)                      AS latitude,
+        ROUND(CAST(longitude  AS DOUBLE), 4)                      AS longitude,
+
+        -- ── Sighting Attributes ────────────────────────────────────────────
+        -- COALESCE ensures ufo_shape is never NULL in Silver downstream
+        COALESCE(TRIM(UFO_shape), 'Unknown')                      AS ufo_shape,
+        CAST(length_of_encounter_seconds AS DOUBLE)               AS duration_seconds,
+        TRIM(Encounter_Duration)                                  AS encounter_duration_text,
+        TRIM(Description)                                         AS description,
+
+        -- ── Derived Columns — BQ5: Duration Analytics ─────────────────────
+        ROUND(CAST(length_of_encounter_seconds AS DOUBLE) / 60, 2) AS duration_minutes,
+
+        CASE
+            WHEN length_of_encounter_seconds < 60    THEN '1. < 1 min'
+            WHEN length_of_encounter_seconds < 300   THEN '2. 1-5 min'
+            WHEN length_of_encounter_seconds < 900   THEN '3. 5-15 min'
+            WHEN length_of_encounter_seconds < 3600  THEN '4. 15-60 min'
+            ELSE '5. > 1 hour'
+        END AS duration_category,
+
+        -- ── Derived Columns — BQ4: Time of Day ────────────────────────────
+        CASE
+            WHEN CAST(Hour AS INT) < 6  THEN '1. Night (0-6h)'
+            WHEN CAST(Hour AS INT) < 12 THEN '2. Morning (6-12h)'
+            WHEN CAST(Hour AS INT) < 18 THEN '3. Afternoon (12-18h)'
+            ELSE '4. Evening (18-24h)'
+        END AS time_of_day,
+
+        -- ── Derived Columns — BQ6: USA vs World ───────────────────────────
+        CASE
+            WHEN TRIM(Country) = 'United States' THEN 'USA'
+            ELSE 'Other Countries'
+        END AS is_usa,
+
+        -- ── Derived Columns — BQ2: Temporal Aggregations ──────────────────
+        -- Decade: groups years into 10-year bands (e.g. 1990, 2000, 2010)
+        CAST(FLOOR(CAST(Year AS INT) / 10) * 10 AS INT)           AS decade,
+        CONCAT(
+            CAST(Year AS STRING), '-',
+            LPAD(CAST(Month AS STRING), 2, '0')
+        )                                                         AS year_month,
+
+        CASE CAST(Month AS INT)
+            WHEN 1  THEN 'Jan' WHEN 2  THEN 'Feb' WHEN 3  THEN 'Mar'
+            WHEN 4  THEN 'Apr' WHEN 5  THEN 'May' WHEN 6  THEN 'Jun'
+            WHEN 7  THEN 'Jul' WHEN 8  THEN 'Aug' WHEN 9  THEN 'Sep'
+            WHEN 10 THEN 'Oct' WHEN 11 THEN 'Nov' WHEN 12 THEN 'Dec'
+        END AS month_name,
+
+        -- month_order: zero-padded string for correct chronological sorting in BI tools
+        LPAD(CAST(Month AS STRING), 2, '0')                       AS month_order,
+        CONCAT(LPAD(CAST(Hour AS STRING), 2, '0'), ':00')         AS hour_label,
+
+        CASE
+            WHEN CAST(Month AS INT) IN (1,2,3)  THEN 'Q1'
+            WHEN CAST(Month AS INT) IN (4,5,6)  THEN 'Q2'
+            WHEN CAST(Month AS INT) IN (7,8,9)  THEN 'Q3'
+            ELSE 'Q4'
+        END AS quarter,
+
+        -- ── Derived Columns — BQ3: Shape Grouping ─────────────────────────
+        -- Top 10 most frequent shapes keep their name; rare shapes → 'Other Shapes'
+        CASE
+            WHEN TRIM(UFO_shape) IN (
+                'Light','Triangle','Circle','Fireball','Sphere',
+                'Disk','Oval','Other','Unknown','Formation'
+            ) THEN TRIM(UFO_shape)
+            WHEN UFO_shape IS NULL THEN 'Unknown'
+            ELSE 'Other Shapes'
+        END AS shape_grouped,
+
+        -- ── Audit Columns ──────────────────────────────────────────────────
+        _ingestion_ts,
+        _source_file,
+        CURRENT_TIMESTAMP() AS _silver_ts
+
+    FROM v_bronze
+    WHERE CAST(Year AS INT) IS NOT NULL          -- drop records with no year (unanalysable)
+      AND CAST(Year AS INT) BETWEEN 1900 AND 2030 -- filter temporal outliers
+
+SILVER_TABLE = "cctb_catalog.ufo_dw.silver_ufo_sightings"
+
+# First run: CREATE the Silver Delta table
+# Subsequent runs: MERGE (UPSERT)
+if not spark.catalog.tableExists(SILVER_TABLE):
+    (
+        df_silver_new
+        .write
+        .format("delta")
+        .mode("overwrite")
+        .option("overwriteSchema", "true")
+        .saveAsTable(SILVER_TABLE)
+    )
+    print(f"[CREATE] {SILVER_TABLE}")
+
+else:
+    dt_silver = DeltaTable.forName(spark, SILVER_TABLE)
+
+    dt_silver.alias("tgt").merge(
+        df_silver_new.alias("src"),
+        "tgt._row_hash = src._row_hash"
+    ).whenMatchedUpdate(
+        # Update only if a meaningful attribute changed at the source
+        condition="""
+            tgt.duration_seconds <> src.duration_seconds  OR
+            tgt.ufo_shape        <> src.ufo_shape          OR
+            tgt.event_timestamp  <> src.event_timestamp
+        """,
+        set={
+            "event_timestamp"   : "src.event_timestamp",
+            "ufo_shape"         : "src.ufo_shape",
+            "duration_seconds"  : "src.duration_seconds",
+            "duration_minutes"  : "src.duration_minutes",
+            "duration_category" : "src.duration_category",
+            "shape_grouped"     : "src.shape_grouped",
+            "_silver_ts"        : "src._silver_ts"
+        }
+    ).whenNotMatchedInsertAll().execute()
+
+    print(f"[MERGE]  {SILVER_TABLE}")
+
+row_count = spark.sql(f"SELECT COUNT(*) AS n FROM {SILVER_TABLE}").collect()[0][0]
+print(f"\nTotal rows in Silver : {row_count:,}")
+
+# Completeness and range checks after transformations
+spark.sql("""
+    SELECT
+        COUNT(*)                                                                       AS total_rows,
+        COUNT(DISTINCT _row_hash)                                                      AS distinct_hashes,
+        ROUND(100.0 * SUM(CASE WHEN country         IS NOT NULL THEN 1 ELSE 0 END)
+                    / COUNT(*), 2)                                                     AS pct_country_filled,
+        ROUND(100.0 * SUM(CASE WHEN ufo_shape       IS NOT NULL THEN 1 ELSE 0 END)
+                    / COUNT(*), 2)                                                     AS pct_shape_filled,
+        ROUND(100.0 * SUM(CASE WHEN event_timestamp IS NOT NULL THEN 1 ELSE 0 END)
+                    / COUNT(*), 2)                                                     AS pct_timestamp_parsed,
+        ROUND(100.0 * SUM(CASE WHEN duration_seconds > 0        THEN 1 ELSE 0 END)
+                    / COUNT(*), 2)                                                     AS pct_valid_duration,
+        MIN(year)                                                                      AS min_year,
+        MAX(year)                                                                      AS max_year,
+        COUNT(DISTINCT country)                                                        AS distinct_countries,
+        COUNT(DISTINCT region)                                                         AS distinct_regions
+    FROM ufo_dw.silver_ufo_sightings
+""").display()
+
+# Identifies extreme duration values that may indicate data entry errors
+spark.sql("""
+    SELECT
+        duration_category,
+        COUNT(*)                            AS sighting_count,
+        ROUND(AVG(duration_seconds), 0)     AS avg_seconds,
+        MIN(duration_seconds)               AS min_seconds,
+        MAX(duration_seconds)               AS max_seconds
+    FROM ufo_dw.silver_ufo_sightings
+    GROUP BY duration_category
+    ORDER BY duration_category
+""").display()
