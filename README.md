@@ -27,6 +27,16 @@ This repository demonstrates how to:
 
 ---
 
+## Business Questions Proposed
+
+1) Which countries and regions have the highest sighting concentration?
+2)  How has sighting frequency evolved over the decades?
+3) What are the most common UFO shapes — do they vary by region?
+4) At what time of day do most sightings occur — does this differ by season?
+5) What is the average and maximum encounter duration by shape and country?
+6) Is there a correlation between season and sighting frequency — USA vs World?
+7) Which year/month combination had the most sightings worldwide?
+
 ## Repository Structure
 
 ```text
