@@ -1,0 +1,146 @@
+Prerequisite: 00_setup/00_setup must have been executed first.
+Purpose: Download raw data from Kaggle and persist it in Delta Lake with no transformations.
+Only audit columns are added: _row_hash, _ingestion_ts, _source_file.
+MERGE strategy: New rows → INSERT Existing rows where a key field changed → UPDATE Unchanged rows → skip (no unnecessary writes)
+
+%pip install kagglehub
+
+# Restart the kernel so the newly installed package is available
+%restart_python
+
+from pyspark.sql import functions as F
+from delta.tables import DeltaTable
+import kagglehub
+from kagglehub import KaggleDatasetAdapter
+
+spark.sql("USE cctb_catalog.ufo_dw")
+print("Environment ready — Bronze layer")
+
+SOURCE_DATASET = "willianoliveiragibin/ufo-sightings"
+SOURCE_FILE    = "ufo-sightings-transformed.csv"
+
+# Download via kagglehub → load as Pandas DataFrame → convert to Spark DataFrame
+df_pandas = kagglehub.dataset_load(
+    KaggleDatasetAdapter.PANDAS,
+    SOURCE_DATASET,
+    SOURCE_FILE,
+    pandas_kwargs={"encoding": "utf-8"}
+)
+
+df_raw = spark.createDataFrame(df_pandas)
+df_raw.createOrReplaceTempView("v_raw_ufo")
+
+print(f"Rows extracted from Kaggle : {df_raw.count():,}")
+print(f"Columns                    : {len(df_raw.columns)}")
+df_raw.printSchema()
+
+# Inspect the raw source data before persisting — helps catch ingestion issues early
+spark.sql("""
+    SELECT
+        Date_time,
+        date_documented,
+        Year, Month, Hour,
+        Season,
+        Country_Code, Country, Region, Locale,
+        latitude, longitude,
+        UFO_shape,
+        length_of_encounter_seconds,
+        Encounter_Duration,
+        LEFT(Description, 80) AS description_preview
+    FROM v_raw_ufo
+    LIMIT 5
+
+BRONZE_TABLE = "cctb_catalog.ufo_dw.bronze_ufo_sightings"
+
+# Build the Bronze DataFrame:
+# - _row_hash is a deterministic surrogate built from all fields that define event identity
+# - All source columns are kept exactly as received (no transformations)
+# - Audit columns record when and where the data came from
+df_bronze_new = spark.sql("""
+    SELECT
+        -- _row_hash: uniquely identifies each raw event
+        -- Built with xxhash64 — deterministic, collision-resistant, returns BIGINT
+        -- COALESCE maps NULLs to '' so they don't produce different hashes
+        xxhash64(
+            COALESCE(Date_time,                                    ''),
+            COALESCE(CAST(Year   AS STRING),                       ''),
+            COALESCE(CAST(Month  AS STRING),                       ''),
+            COALESCE(CAST(Hour   AS STRING),                       ''),
+            COALESCE(Country_Code,                                 ''),
+            COALESCE(Country,                                      ''),
+            COALESCE(Region,                                       ''),
+            COALESCE(Locale,                                       ''),
+            COALESCE(CAST(latitude   AS STRING),                   ''),
+            COALESCE(CAST(longitude  AS STRING),                   ''),
+            COALESCE(UFO_shape,                                    ''),
+            COALESCE(CAST(length_of_encounter_seconds AS STRING),  '')
+        )                                        AS _row_hash,
+
+        -- Original source columns — no transformations applied at this layer
+        Date_time,
+        date_documented,
+        Year,
+        Month,
+        Hour,
+        Season,
+        Country_Code,
+        Country,
+        Region,
+        Locale,
+        CAST(latitude   AS DOUBLE)               AS latitude,
+        CAST(longitude  AS DOUBLE)               AS longitude,
+        UFO_shape,
+        CAST(length_of_encounter_seconds AS DOUBLE) AS length_of_encounter_seconds,
+        Encounter_Duration,
+        Description,
+
+        -- Audit columns
+        CURRENT_TIMESTAMP()                      AS _ingestion_ts,
+        'kaggle/ufo-sightings-transformed.csv'   AS _source_file
+
+    FROM v_raw_ufo
+""")
+
+# First run: CREATE the Delta table
+# Subsequent runs: MERGE (UPSERT) to handle new and updated records
+if not spark.catalog.tableExists(BRONZE_TABLE):
+    (
+        df_bronze_new
+        .write
+        .format("delta")
+        .mode("overwrite")
+        .option("overwriteSchema", "true")
+        .saveAsTable(BRONZE_TABLE)
+    )
+    print(f"[CREATE] {BRONZE_TABLE}")
+
+else:
+    dt_bronze = DeltaTable.forName(spark, BRONZE_TABLE)
+
+    dt_bronze.alias("tgt").merge(
+        df_bronze_new.alias("src"),
+        # Match on the row hash — same event = same hash
+        "tgt._row_hash = src._row_hash"
+    ).whenMatchedUpdate(
+        # Only write if at least one meaningful field actually changed
+        condition="""
+            tgt.Country                        <> src.Country                        OR
+            tgt.Region                         <> src.Region                         OR
+            tgt.UFO_shape                      <> src.UFO_shape                      OR
+            tgt.length_of_encounter_seconds    <> src.length_of_encounter_seconds    OR
+            tgt.Date_time                      <> src.Date_time
+        """,
+        set={
+            "Country"                      : "src.Country",
+            "Region"                       : "src.Region",
+            "UFO_shape"                    : "src.UFO_shape",
+            "length_of_encounter_seconds"  : "src.length_of_encounter_seconds",
+            "Date_time"                    : "src.Date_time",
+            "_ingestion_ts"                : "src._ingestion_ts"
+        }
+    ).whenNotMatchedInsertAll().execute()
+
+    print(f"[MERGE]  {BRONZE_TABLE}")
+
+row_count = spark.sql(f"SELECT COUNT(*) AS n FROM {BRONZE_TABLE}").collect()[0][0]
+print(f"\nTotal rows in Bronze : {row_count:,}")
