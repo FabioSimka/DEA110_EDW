@@ -1,0 +1,153 @@
+                          ## Visualization 1
+
+WITH ranked AS (
+  SELECT
+    dl.country,
+    dl.region,
+    COUNT(fs.sighting_key) AS sighting_count,
+    RANK() OVER (ORDER BY COUNT(fs.sighting_key) DESC) AS rank
+  FROM
+    `cctb_catalog`.`ufo_dw`.`fact_sighting` fs
+      LEFT JOIN `cctb_catalog`.`ufo_dw`.`dim_location` dl
+        ON fs.sk_location = dl.location_key
+  WHERE
+    dl.country IS NOT NULL
+    AND dl.region IS NOT NULL
+  GROUP BY
+    dl.country,
+    dl.region
+)
+SELECT
+  country,
+  region,
+  sighting_count
+FROM
+  ranked
+WHERE
+  rank <= 20
+ORDER BY
+  sighting_count DESC;
+
+                      ## Visualization 2
+
+SELECT
+  dd.decade,
+  COUNT(fs.sighting_key) AS sighting_count
+FROM
+  `cctb_catalog`.`ufo_dw`.`fact_sighting` fs
+    LEFT JOIN `cctb_catalog`.`ufo_dw`.`dim_date` dd
+      ON fs.sk_date = dd.date_key
+WHERE
+  dd.decade IS NOT NULL
+GROUP BY
+  dd.decade
+ORDER BY
+  dd.decade ASC;
+
+                    ## Visualization 3
+
+SELECT
+  dl.region,
+  dus.shape_grouped,
+  COUNT(fs.sighting_key) AS sighting_count
+FROM
+  `cctb_catalog`.`ufo_dw`.`fact_sighting` fs
+    LEFT JOIN `cctb_catalog`.`ufo_dw`.`dim_ufo_shape` dus
+      ON fs.sk_ufo_shape = dus.shape_key
+    LEFT JOIN `cctb_catalog`.`ufo_dw`.`dim_location` dl
+      ON fs.sk_location = dl.location_key
+WHERE
+  dus.shape_grouped IS NOT NULL
+  AND dl.region IS NOT NULL
+GROUP BY
+  dl.region,
+  dus.shape_grouped
+ORDER BY
+  sighting_count DESC
+LIMIT 20;
+
+  
+                    ## Visualization 4
+
+SELECT
+  dd.season,
+  dt.time_of_day,
+  COUNT(fs.sighting_key) AS sighting_count
+FROM
+  `cctb_catalog`.`ufo_dw`.`fact_sighting` fs
+    LEFT JOIN `cctb_catalog`.`ufo_dw`.`dim_time` dt
+      ON fs.sk_time = dt.time_key
+    LEFT JOIN `cctb_catalog`.`ufo_dw`.`dim_date` dd
+      ON fs.sk_date = dd.date_key
+WHERE
+  dt.time_of_day IS NOT NULL
+  AND dd.season IS NOT NULL
+GROUP BY
+  dd.season,
+  dt.time_of_day
+ORDER BY
+  dd.season,
+  dt.time_of_day
+LIMIT 20;
+
+                          ## Visualization 5
+
+SELECT
+  dl.country,
+  dus.shape_grouped,
+  ROUND(AVG(fs.duration_seconds), 2) AS avg_duration_seconds,
+  ROUND(MAX(fs.duration_seconds), 2) AS max_duration_seconds
+FROM
+  `cctb_catalog`.`ufo_dw`.`fact_sighting` fs
+    LEFT JOIN `cctb_catalog`.`ufo_dw`.`dim_ufo_shape` dus
+      ON fs.sk_ufo_shape = dus.shape_key
+    LEFT JOIN `cctb_catalog`.`ufo_dw`.`dim_location` dl
+      ON fs.sk_location = dl.location_key
+WHERE
+  dus.shape_grouped IS NOT NULL
+  AND dl.country IS NOT NULL
+GROUP BY
+  dl.country,
+  dus.shape_grouped
+ORDER BY
+  avg_duration_seconds DESC
+LIMIT 20;
+
+                              ## Visualization 6
+
+SELECT
+  dl.is_usa AS region_group,
+  dd.season,
+  COUNT(fs.sighting_key) AS sighting_count
+FROM
+  `cctb_catalog`.`ufo_dw`.`fact_sighting` fs
+    LEFT JOIN `cctb_catalog`.`ufo_dw`.`dim_date` dd
+      ON fs.sk_date = dd.date_key
+    LEFT JOIN `cctb_catalog`.`ufo_dw`.`dim_location` dl
+      ON fs.sk_location = dl.location_key
+WHERE
+  dd.season IS NOT NULL
+  AND dl.is_usa IS NOT NULL
+GROUP BY
+  dl.is_usa,
+  dd.season
+ORDER BY
+  dl.is_usa DESC,
+  dd.season
+
+                           ## Visualization 7
+
+SELECT
+  dd.year_month,
+  COUNT(fs.sighting_key) AS sighting_count
+FROM
+  `cctb_catalog`.`ufo_dw`.`fact_sighting` fs
+    LEFT JOIN `cctb_catalog`.`ufo_dw`.`dim_date` dd
+      ON fs.sk_date = dd.date_key
+WHERE
+  dd.year_month IS NOT NULL
+GROUP BY
+  dd.year_month
+ORDER BY
+  sighting_count DESC
+LIMIT 1;
