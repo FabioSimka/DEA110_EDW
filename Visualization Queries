@@ -135,19 +135,4 @@ ORDER BY
   dl.is_usa DESC,
   dd.season
 
-                           ## Visualization 7
-
-SELECT
-  dd.year_month,
-  COUNT(fs.sighting_key) AS sighting_count
-FROM
-  `cctb_catalog`.`ufo_dw`.`fact_sighting` fs
-    LEFT JOIN `cctb_catalog`.`ufo_dw`.`dim_date` dd
-      ON fs.sk_date = dd.date_key
-WHERE
-  dd.year_month IS NOT NULL
-GROUP BY
-  dd.year_month
-ORDER BY
-  sighting_count DESC
-LIMIT 1;
+                           
