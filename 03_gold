@@ -1,0 +1,854 @@
+## DIM_DATE Table
+
+from pyspark.sql import functions as F
+from delta.tables import DeltaTable
+
+spark.sql("USE cctb_catalog.ufo_dw")
+print("Environment ready — dim_date")
+
+df_silver = spark.sql("SELECT * FROM cctb_catalog.ufo_dw.silver_ufo_sightings")
+df_silver.createOrReplaceTempView("v_silver")
+print(f"Silver rows loaded: {df_silver.count():,}")
+
+%sql
+SELECT DISTINCT
+        -- Surrogate Key: deterministic hash on the grain columns (year + month)
+        -- NOTE: Season is intentionally excluded from the key — it is a derived
+        -- attribute of the month. Including it would create duplicate rows for
+        -- the same period if the source contains inconsistent season labels.
+        xxhash64(year, month)     AS date_key,
+
+        -- Dimension attributes
+        cast(event_timestamp as date) AS event_date,      
+        year,
+        month,
+        day(event_date) as day,
+        dayofweek(event_date) as dayofweek,
+        dayname(event_date) as dayname,
+        month_name,
+        month_order,              -- zero-padded string for BI tool sort order
+        quarter,
+        season,
+        decade,
+        year_month                -- formatted string e.g. '2012-07' for labels
+    FROM v_silver
+    WHERE year  IS NOT NULL
+      AND month IS NOT NULL
+
+DIM_TABLE = "cctb_catalog.ufo_dw.dim_date"
+
+df_dim = spark.sql("""
+SELECT DISTINCT
+        -- Surrogate Key: deterministic hash on the grain columns (year + month)
+        -- NOTE: Season is intentionally excluded from the key — it is a derived
+        -- attribute of the month. Including it would create duplicate rows for
+        -- the same period if the source contains inconsistent season labels.
+        xxhash64(year, month)     AS date_key,
+
+        -- Dimension attributes
+        cast(event_timestamp as date) AS event_date,      
+        year,
+        month,
+        day(event_date) as day,
+        dayofweek(event_date) as dayofweek,
+        dayname(event_date) as dayname,
+        month_name,
+        month_order,              -- zero-padded string for BI tool sort order
+        quarter,
+        season,
+        decade,
+        year_month                -- formatted string e.g. '2012-07' for labels
+    FROM v_silver
+    WHERE year  IS NOT NULL
+      AND month IS NOT NULL
+""")
+
+if not spark.catalog.tableExists(DIM_TABLE):
+    df_dim.write.format("delta").mode("overwrite").saveAsTable(DIM_TABLE)
+    print(f"[CREATE] {DIM_TABLE}")
+else:
+    DeltaTable.forName(spark, DIM_TABLE).alias("tgt").merge(
+        df_dim.alias("src"),
+        "tgt.date_key = src.date_key"
+    ).whenMatchedUpdate(
+        # SCD Type 1: overwrite if season label or decade changed at the source
+        condition="tgt.season <> src.season OR tgt.decade <> src.decade",
+        set={
+            "season"     : "src.season",
+            "decade"     : "src.decade",
+            "year_month" : "src.year_month"
+        }
+    ).whenNotMatchedInsertAll().execute()
+    print(f"[MERGE]  {DIM_TABLE}")
+
+spark.sql("""
+    SELECT
+        COUNT(*)             AS total_rows,
+        MIN(year)            AS min_year,
+        MAX(year)            AS max_year,
+        COUNT(DISTINCT year) AS distinct_years,
+        COUNT(DISTINCT quarter) AS quarters_present
+    FROM cctb_catalog.ufo_dw.dim_date
+""").display()
+
+# Sample rows ordered chronologically
+spark.sql("SELECT * FROM ufo_dw.dim_date ORDER BY year, month LIMIT 12").display()
+
+
+## DIM_TIME Table
+
+from pyspark.sql import functions as F
+from delta.tables import DeltaTable
+
+spark.sql("USE cctb_catalog.ufo_dw")
+print("Environment ready — dim_time")
+
+df_silver = spark.sql("SELECT * FROM cctb_catalog.ufo_dw.silver_ufo_sightings")
+df_silver.createOrReplaceTempView("v_silver")
+print(f"Silver rows loaded: {df_silver.count():,}")
+
+
+df_dim = spark.sql("""
+    SELECT DISTINCT
+        -- Surrogate Key: hash on hour — produces at most 24 unique keys
+        xxhash64(hour)      AS time_key,
+
+        -- Dimension attributes
+        hour,
+        hour_label,         -- formatted string e.g. '21:00'
+        time_of_day,        -- time band: Night / Morning / Afternoon / Evening
+        -- is_night: convenience flag for night-time filtering in BI tools
+        CASE WHEN hour < 6 OR hour >= 20 THEN 1 ELSE 0 END AS is_night
+    FROM v_silver
+    WHERE hour IS NOT NULL
+      AND hour BETWEEN 0 AND 23   -- guard against malformed hour values
+""")
+
+if not spark.catalog.tableExists(DIM_TABLE):
+    df_dim.write.format("delta").mode("overwrite").saveAsTable(DIM_TABLE)
+    print(f"[CREATE] {DIM_TABLE}")
+else:
+    DeltaTable.forName(spark, DIM_TABLE).alias("tgt").merge(
+        df_dim.alias("src"),
+        "tgt.time_key = src.time_key"
+    ).whenMatchedUpdate(
+        condition="tgt.time_of_day <> src.time_of_day",
+        set={
+            "time_of_day" : "src.time_of_day",
+            "hour_label"  : "src.hour_label"
+        }
+    ).whenNotMatchedInsertAll().execute()
+    print(f"[MERGE]  {DIM_TABLE}")
+
+spark.sql("""
+    SELECT
+        COUNT(*)      AS total_rows,
+        MIN(hour)     AS min_hour,
+        MAX(hour)     AS max_hour,
+        SUM(is_night) AS night_hour_count
+    FROM cctb_catalog.ufo_dw.dim_time
+""").display()
+
+# Full dimension — all 24 hours
+spark.sql("SELECT * FROM cctb_catalog.ufo_dw.dim_time ORDER BY hour").display(24)
+
+## DIM_LOCATION Table
+
+from pyspark.sql import functions as F
+from delta.tables import DeltaTable
+
+spark.sql("USE cctb_catalog.ufo_dw")
+print("Environment ready — dim_location")
+
+df_silver = spark.sql("SELECT * FROM cctb_catalog.ufo_dw.silver_ufo_sightings")
+df_silver.createOrReplaceTempView("v_silver")
+print(f"Silver rows loaded: {df_silver.count():,}")
+
+DIM_TABLE = "cctb_catalog.ufo_dw.dim_location"
+
+df_dim = spark.sql("""
+    SELECT DISTINCT
+        -- Surrogate Key: hash over all location-defining fields
+        -- COALESCE maps NULLs to '' so unknown locations still get a consistent key
+        -- Coordinates are already rounded to 4 decimal places in the Silver layer
+        xxhash64(
+            COALESCE(country_code, ''),
+            COALESCE(country,      ''),
+            COALESCE(region,       ''),
+            COALESCE(locale,       ''),
+            COALESCE(CAST(latitude  AS STRING), ''),
+            COALESCE(CAST(longitude AS STRING), '')
+        )               AS location_key,
+
+        -- Dimension attributes
+        country_code,
+        country,
+        region,
+        locale,
+        latitude,
+        longitude,
+        is_usa          -- 'USA' | 'Other Countries' — supports BQ6 slicing
+    FROM v_silver
+    -- Records without a country are still included: country = NULL is a valid
+    -- 'unknown location' state, mapped to is_usa = 'Other Countries'
+""")
+
+if not spark.catalog.tableExists(DIM_TABLE):
+    df_dim.write.format("delta").mode("overwrite").saveAsTable(DIM_TABLE)
+    print(f"[CREATE] {DIM_TABLE}")
+else:
+    DeltaTable.forName(spark, DIM_TABLE).alias("tgt").merge(
+        df_dim.alias("src"),
+        "tgt.location_key = src.location_key"
+    ).whenMatchedUpdate(
+        # SCD Type 1: overwrite if the country or region name was corrected at source
+        condition="""
+            tgt.country      <> src.country       OR
+            tgt.region       <> src.region         OR
+            tgt.country_code <> src.country_code
+        """,
+        set={
+            "country"      : "src.country",
+            "region"       : "src.region",
+            "country_code" : "src.country_code",
+            "is_usa"       : "src.is_usa"
+        }
+    ).whenNotMatchedInsertAll().execute()
+    print(f"[MERGE]  {DIM_TABLE}")
+spark.sql("""
+    SELECT
+        COUNT(*)                                             AS total_rows,
+        COUNT(DISTINCT country)                              AS distinct_countries,
+        COUNT(DISTINCT region)                               AS distinct_regions,
+        SUM(CASE WHEN country IS NULL THEN 1 ELSE 0 END)     AS unknown_country_rows,
+        SUM(CASE WHEN is_usa = 'USA'  THEN 1 ELSE 0 END)     AS usa_locations
+    FROM cctb_catalog.ufo_dw.dim_location
+""").display()
+
+# Top 10 countries by number of distinct locations
+spark.sql("""
+    SELECT country, COUNT(*) AS location_count
+    FROM cctb_catalog.ufo_dw.dim_location
+    WHERE country IS NOT NULL
+    GROUP BY country
+    ORDER BY location_count DESC
+    LIMIT 10
+""").display()
+
+## DIM_UFO_SHAPE Table
+
+from pyspark.sql import functions as F
+from delta.tables import DeltaTable
+
+spark.sql("USE cctb_catalog.ufo_dw")
+print("Environment ready — dim_ufo_shape")
+
+df_silver = spark.sql("SELECT * FROM cctb_catalog.ufo_dw.silver_ufo_sightings")
+df_silver.createOrReplaceTempView("v_silver")
+print(f"Silver rows loaded: {df_silver.count():,}")
+
+df_dim = spark.sql("""
+    SELECT DISTINCT
+        -- Surrogate Key: hash on the cleaned shape value
+        -- ufo_shape is already COALESCE'd to 'Unknown' in the Silver layer
+        xxhash64(ufo_shape)   AS shape_key,
+
+        -- Dimension attributes
+        ufo_shape,            -- raw/cleaned value (e.g. 'Fireball', 'Triangle')
+        shape_grouped         -- aggregated label for executive-level dashboards
+                              -- Top 10 frequent shapes keep their name;
+                              -- all others collapse to 'Other Shapes'
+    FROM v_silver
+""")
+
+if not spark.catalog.tableExists(DIM_TABLE):
+    df_dim.write.format("delta").mode("overwrite").saveAsTable(DIM_TABLE)
+    print(f"[CREATE] {DIM_TABLE}")
+else:
+    DeltaTable.forName(spark, DIM_TABLE).alias("tgt").merge(
+        df_dim.alias("src"),
+        "tgt.shape_key = src.shape_key"
+    ).whenMatchedUpdate(
+        # Update if the grouping label was reclassified
+        condition="tgt.shape_grouped <> src.shape_grouped",
+        set={"shape_grouped": "src.shape_grouped"}
+    ).whenNotMatchedInsertAll().execute()
+    print(f"[MERGE]  {DIM_TABLE}")
+
+# Distribution of raw shapes across grouped categories
+spark.sql("""
+    SELECT
+        shape_grouped,
+        COUNT(*) AS raw_shape_count
+    FROM ufo_dw.dim_ufo_shape
+    GROUP BY shape_grouped
+    ORDER BY raw_shape_count DESC
+""").display()
+
+# Full dimension listing
+spark.sql("SELECT * FROM ufo_dw.dim_ufo_shape ORDER BY ufo_shape").display(50)
+
+## DIM_DURATION Table
+
+from pyspark.sql import functions as F
+from delta.tables import DeltaTable
+
+spark.sql("USE cctb_catalog.ufo_dw")
+print("Environment ready — dim_duration")
+
+DIM_TABLE = "cctb_catalog.ufo_dw.dim_duration"
+
+# Static dimension: 5 business-defined duration bands
+# These bands match the duration_category values computed in the Silver layer,
+# ensuring every fact row can be joined to this dimension without orphan records
+df_dim = spark.sql("""
+    SELECT
+        xxhash64(duration_category) AS duration_key,
+        duration_category,
+        min_seconds,
+        max_seconds,
+        sort_order                  -- integer used for correct ordering in BI tools
+    FROM (
+        SELECT '1. < 1 min'    AS duration_category,    0 AS min_seconds,        59 AS max_seconds, 1 AS sort_order
+        UNION ALL SELECT '2. 1-5 min',                 60,                      299,               2
+        UNION ALL SELECT '3. 5-15 min',               300,                      899,               3
+        UNION ALL SELECT '4. 15-60 min',              900,                     3599,               4
+        UNION ALL SELECT '5. > 1 hour',              3600,               999999999,               5
+    )
+""")
+
+if not spark.catalog.tableExists(DIM_TABLE):
+    df_dim.write.format("delta").mode("overwrite").saveAsTable(DIM_TABLE)
+    print(f"[CREATE] {DIM_TABLE}")
+else:
+    DeltaTable.forName(spark, DIM_TABLE).alias("tgt").merge(
+        df_dim.alias("src"),
+        "tgt.duration_key = src.duration_key"
+    ).whenMatchedUpdate(
+        # Update if band boundaries were redefined
+        condition="tgt.max_seconds <> src.max_seconds OR tgt.min_seconds <> src.min_seconds",
+        set={
+            "max_seconds" : "src.max_seconds",
+            "min_seconds" : "src.min_seconds"
+        }
+    ).whenNotMatchedInsertAll().execute()
+    print(f"[MERGE]  {DIM_TABLE}")
+# Should always contain exactly 5 rows ordered by sort_order
+spark.sql("SELECT * FROM cctb_catalog.ufo_dw.dim_duration ORDER BY sort_order").display()
+
+## FACT_sIGHTINGS Table
+
+from pyspark.sql import functions as F
+from delta.tables import DeltaTable
+
+spark.sql("USE cctb_catalog.ufo_dw")
+print("Environment ready — fact_sighting")
+
+df_silver = spark.sql("SELECT * FROM cctb_catalog.ufo_dw.silver_ufo_sightings")
+df_silver.createOrReplaceTempView("v_silver")
+
+# Load all dimension tables as TempViews
+spark.sql("SELECT * FROM cctb_catalog.ufo_dw.dim_date").createOrReplaceTempView("v_dim_date")
+spark.sql("SELECT * FROM cctb_catalog.ufo_dw.dim_time").createOrReplaceTempView("v_dim_time")
+spark.sql("SELECT * FROM cctb_catalog.ufo_dw.dim_location").createOrReplaceTempView("v_dim_location")
+spark.sql("SELECT * FROM cctb_catalog.ufo_dw.dim_ufo_shape").createOrReplaceTempView("v_dim_ufo_shape")
+spark.sql("SELECT * FROM cctb_catalog.ufo_dw.dim_duration").createOrReplaceTempView("v_dim_duration")
+
+print("Silver and all dimensions loaded as TempViews")
+
+print(f"Silver rows loaded: {df_silver.count():,}")
+
+source_df = spark.sql("""
+
+    SELECT DISTINCT
+
+        -- Original Silver fields (business attributes carried into the fact)
+        s.event_timestamp,
+        s.date_documented,
+        s.year,
+        s.month,
+        s.hour,
+        s.season,
+        s.country_code,
+        s.country,
+        s.region,
+        s.locale,
+        s.latitude,
+        s.longitude,
+        s.ufo_shape,
+        s.duration_seconds,
+        s.duration_minutes,
+        s.duration_category,
+        s.time_of_day,
+        s.is_usa,
+        s.description,
+        s._ingestion_ts,
+
+        -- Additive measure: always 1 per row, allows COUNT via SUM in BI tools
+        1 AS sighting_count,
+
+        -- SK columns resolved by joining dimension tables on their natural keys
+        d_date.date_key      AS sk_date,
+        d_time.time_key      AS sk_time,
+        d_loc.location_key   AS sk_location,
+        d_shp.shape_key      AS sk_ufo_shape,
+        d_dur.duration_key   AS sk_duration
+
+    FROM v_silver AS s
+
+    LEFT JOIN v_dim_date AS d_date
+        ON  s.year  = d_date.year
+        AND s.month = d_date.month
+
+    LEFT JOIN v_dim_time AS d_time
+        ON s.hour = d_time.hour
+
+    LEFT JOIN v_dim_location AS d_loc
+        ON  COALESCE(s.country_code, '') = COALESCE(d_loc.country_code, '')
+        AND COALESCE(s.country,      '') = COALESCE(d_loc.country,      '')
+        AND COALESCE(s.region,       '') = COALESCE(d_loc.region,       '')
+        AND COALESCE(s.locale,       '') = COALESCE(d_loc.locale,       '')
+        AND COALESCE(s.latitude,      0) = COALESCE(d_loc.latitude,      0)
+        AND COALESCE(s.longitude,     0) = COALESCE(d_loc.longitude,     0)
+
+    LEFT JOIN v_dim_ufo_shape AS d_shp
+        ON s.ufo_shape = d_shp.ufo_shape
+
+    LEFT JOIN v_dim_duration AS d_dur
+        ON s.duration_category = d_dur.duration_category
+
+    WHERE s.year IS NOT NULL
+
+""")
+
+print(f"Source DataFrame rows: {source_df.count():,}")
+source_df.printSchema()
+
+source_df = source_df.withColumn(
+    "sighting_key",
+    F.xxhash64(
+        F.coalesce(F.col("event_timestamp").cast("string"), F.lit("")),
+        F.coalesce(F.col("country"),                         F.lit("")),
+        F.coalesce(F.col("region"),                          F.lit("")),
+        F.coalesce(F.col("locale"),                          F.lit("")),
+        F.coalesce(F.col("ufo_shape"),                       F.lit("")),
+        F.coalesce(F.col("duration_seconds").cast("string"), F.lit(""))
+    )
+)
+
+source_df.createOrReplaceTempView("v_fact_source")
+print("sighting_key column added")
+
+FACT_TABLE = "cctb_catalog.ufo_dw.fact_sighting"
+if not spark.catalog.tableExists(FACT_TABLE):
+    (
+        source_df
+        .write
+        .format("delta")
+        .mode("overwrite")
+        .option("overwriteSchema", "true")
+        .saveAsTable(FACT_TABLE)
+    )
+    print(f"[CREATE] {FACT_TABLE}")
+
+else:
+    DeltaTable.forName(spark, FACT_TABLE).alias("tgt").merge(
+        source_df.alias("src"),
+        "tgt.sighting_key = src.sighting_key"
+    ).whenMatchedUpdate(
+        # Update only if duration or timestamp was corrected at the source
+        condition="""
+            tgt.duration_seconds <> src.duration_seconds  OR
+            tgt.event_timestamp  <> src.event_timestamp
+        """,
+        set={
+            "duration_seconds" : "src.duration_seconds",
+            "duration_minutes" : "src.duration_minutes",
+            "event_timestamp"  : "src.event_timestamp",
+            "sk_duration"      : "src.sk_duration",
+            "_ingestion_ts"    : "src._ingestion_ts"
+        }
+    ).whenNotMatchedInsertAll().execute()
+    print(f"[MERGE]  {FACT_TABLE}")
+
+row_count = spark.sql(f"SELECT COUNT(*) AS n FROM {FACT_TABLE}").collect()[0][0]
+print(f"\nTotal rows in fact_sighting : {row_count:,}")
+
+spark.sql("""
+    SELECT
+        COUNT(*)                        AS total_rows,
+        COUNT(DISTINCT sighting_key)    AS distinct_keys,
+        COUNT(DISTINCT sk_location)     AS distinct_locations,
+        COUNT(DISTINCT sk_ufo_shape)    AS distinct_shapes,
+        ROUND(AVG(duration_minutes), 2) AS avg_duration_min,
+        ROUND(MAX(duration_minutes), 2) AS max_duration_min,
+        SUM(sighting_count)             AS total_sightings
+    FROM cctb_catalog.ufo_dw.fact_sighting
+""").display()
+
+# All orphan_rows values must equal 0
+# NULL SK means the LEFT JOIN did not find a match in the dimension
+spark.sql("""
+    SELECT 'sk_date'      AS sk_column, COUNT(*) AS orphan_rows
+    FROM cctb_catalog.ufo_dw.fact_sighting WHERE sk_date IS NULL
+    UNION ALL
+    SELECT 'sk_time',      COUNT(*) FROM cctb_catalog.ufo_dw.fact_sighting WHERE sk_time IS NULL
+    UNION ALL
+    SELECT 'sk_location',  COUNT(*) FROM cctb_catalog.ufo_dw.fact_sighting WHERE sk_location IS NULL
+    UNION ALL
+    SELECT 'sk_ufo_shape', COUNT(*) FROM cctb_catalog.ufo_dw.fact_sighting WHERE sk_ufo_shape IS NULL
+    UNION ALL
+    SELECT 'sk_duration',  COUNT(*) FROM cctb_catalog.ufo_dw.fact_sighting WHERE sk_duration IS NULL
+""").show()
+
+## FACT MONTHLY Table
+
+from pyspark.sql import functions as F
+from delta.tables import DeltaTable
+
+spark.sql("USE cctb_catalog.ufo_dw")
+print("Environment ready — fact_monthly_agg")
+
+df_silver = spark.sql("SELECT * FROM cctb_catalog.ufo_dw.silver_ufo_sightings")
+df_silver.createOrReplaceTempView("v_silver")
+
+# Dimensions loaded as TempViews — Databricks traces lineage automatically
+spark.sql("SELECT * FROM cctb_catalog.ufo_dw.dim_date").createOrReplaceTempView("v_dim_date")
+spark.sql("SELECT * FROM cctb_catalog.ufo_dw.dim_location").createOrReplaceTempView("v_dim_location")
+spark.sql("SELECT * FROM cctb_catalog.ufo_dw.dim_ufo_shape").createOrReplaceTempView("v_dim_ufo_shape")
+
+print("Silver and dimensions loaded")
+
+print(f"Silver rows loaded: {df_silver.count():,}")
+
+# Step 1: aggregate Silver to monthly grain, then join dimensions for SKs
+# dim_time is not joined here — time-of-day is not meaningful at monthly grain
+# dim_duration is not joined here — duration bands collapse across the month
+
+source_df = spark.sql("""
+
+    SELECT
+
+        -- Original aggregated fields
+        s.year,
+        s.month,
+        s.month_name,
+        s.quarter,
+        COALESCE(s.country, 'Unknown')   AS country,
+        s.country_code,
+        s.is_usa,
+        s.shape_grouped,
+
+        -- Aggregated measures
+        COUNT(*)                                                       AS total_sightings,
+        SUM(s.duration_seconds)                                        AS total_duration_sec,
+        -- avg_duration_min is semi-additive: never SUM across countries
+        ROUND(AVG(s.duration_minutes), 4)                              AS avg_duration_min,
+        -- max_duration_min is non-additive
+        ROUND(MAX(s.duration_minutes), 4)                              AS max_duration_min,
+        -- Percentage of sightings in night hours (hour < 6 or >= 20)
+        ROUND(
+            100.0 * SUM(CASE WHEN s.hour < 6 OR s.hour >= 20 THEN 1 ELSE 0 END)
+                  / COUNT(*), 2
+        )                                                              AS pct_night_sightings,
+
+        -- SKs resolved from dimension joins
+        d_date.date_key      AS sk_date,
+        d_loc.location_key   AS sk_location,
+        d_shp.shape_key      AS sk_ufo_shape,
+
+        CURRENT_TIMESTAMP()  AS _agg_ts
+
+    FROM v_silver AS s
+
+    LEFT JOIN v_dim_date AS d_date
+        ON  s.year  = d_date.year
+        AND s.month = d_date.month
+
+    -- Location join at country level (region and locale are blank for aggregation)
+    LEFT JOIN v_dim_location AS d_loc
+        ON  COALESCE(s.country_code, '') = COALESCE(d_loc.country_code, '')
+        AND COALESCE(s.country,      '') = COALESCE(d_loc.country,      '')
+        AND d_loc.region   = ''
+        AND d_loc.locale   = ''
+        AND d_loc.latitude  = 0
+        AND d_loc.longitude = 0
+
+    -- Shape join using the grouped label (coarser than fact_sighting)
+    LEFT JOIN v_dim_ufo_shape AS d_shp
+        ON s.shape_grouped = d_shp.ufo_shape
+
+    WHERE s.year IS NOT NULL
+    GROUP BY
+        s.year, s.month, s.month_name, s.quarter,
+        s.country, s.country_code, s.is_usa,
+        s.shape_grouped,
+        d_date.date_key,
+        d_loc.location_key,
+        d_shp.shape_key
+
+""")
+
+source_df = source_df.drop("_silver_ts", "_source_file")
+print(f"Source DataFrame rows: {source_df.count():,}")
+
+source_df = source_df.withColumn(
+    "monthly_key",
+    F.xxhash64(
+        F.coalesce(F.col("year").cast("string"),  F.lit("")),
+        F.coalesce(F.col("month").cast("string"), F.lit("")),
+        F.coalesce(F.col("country"),              F.lit("")),
+        F.coalesce(F.col("shape_grouped"),        F.lit(""))
+    )
+)
+
+source_df.createOrReplaceTempView("v_fact_monthly_source")
+print("monthly_key column added")
+
+FACT_TABLE = "cctb_catalog.ufo_dw.fact_monthly_agg"
+
+if not spark.catalog.tableExists(FACT_TABLE):
+    (
+        source_df
+        .write
+        .format("delta")
+        .mode("overwrite")
+        .option("overwriteSchema", "true")
+        .saveAsTable(FACT_TABLE)
+    )
+    print(f"[CREATE] {FACT_TABLE}")
+
+else:
+    DeltaTable.forName(spark, FACT_TABLE).alias("tgt").merge(
+        source_df.alias("src"),
+        "tgt.monthly_key = src.monthly_key"
+    ).whenMatchedUpdate(
+        # Re-aggregate if totals or averages changed (e.g. source corrections)
+        condition="""
+            tgt.total_sightings  <> src.total_sightings  OR
+            tgt.avg_duration_min <> src.avg_duration_min
+        """,
+        set={
+            "total_sightings"     : "src.total_sightings",
+            "total_duration_sec"  : "src.total_duration_sec",
+            "avg_duration_min"    : "src.avg_duration_min",
+            "max_duration_min"    : "src.max_duration_min",
+            "pct_night_sightings" : "src.pct_night_sightings",
+            "_agg_ts"             : "src._agg_ts"
+        }
+    ).whenNotMatchedInsertAll().execute()
+    print(f"[MERGE]  {FACT_TABLE}")
+
+row_count = spark.sql(f"SELECT COUNT(*) AS n FROM {FACT_TABLE}").collect()[0][0]
+print(f"\nTotal rows in fact_monthly_agg : {row_count:,}")
+
+spark.sql("""
+    SELECT
+        COUNT(*)                        AS total_rows,
+        SUM(total_sightings)            AS grand_total_sightings,
+        MIN(year)                       AS min_year,
+        MAX(year)                       AS max_year,
+        COUNT(DISTINCT country)         AS distinct_countries,
+        COUNT(DISTINCT shape_grouped)   AS distinct_shape_groups
+    FROM cctb_catalog.ufo_dw.fact_monthly_agg
+""").display()
+
+spark.sql("""
+    SELECT 'sk_date'      AS sk_column, COUNT(*) AS orphan_rows
+    FROM cctb_catalog.ufo_dw.fact_monthly_agg WHERE sk_date IS NULL
+    UNION ALL
+    SELECT 'sk_location',  COUNT(*) FROM cctb_catalog.ufo_dw.fact_monthly_agg WHERE sk_location IS NULL
+    UNION ALL
+    SELECT 'sk_ufo_shape', COUNT(*) FROM cctb_catalog.ufo_dw.fact_monthly_agg WHERE sk_ufo_shape IS NULL
+""").show()
+
+spark.sql("""
+    SELECT
+        f.year,
+        f.month_name,
+        d.year_month,
+        SUM(f.total_sightings)             AS sightings,
+        ROUND(AVG(f.avg_duration_min), 1)  AS avg_duration_min
+    FROM cctb_catalog.ufo_dw.fact_monthly_agg f
+    JOIN cctb_catalog.ufo_dw.dim_date d ON f.sk_date = d.date_key
+    GROUP BY f.year, f.month_name, d.year_month
+    ORDER BY sightings DESC
+    LIMIT 10
+""").show()
+
+## DATA VALIDATION
+
+from pyspark.sql import functions as F
+
+spark.sql("USE cctb_catalog.ufo_dw")
+print("Environment ready — Validation & Analytics")
+
+# Provides a full picture of how many rows exist at each layer of the pipeline
+spark.sql("""
+    SELECT 'Bronze' AS stage, 'bronze_ufo_sightings'  AS table_name, COUNT(*) AS rows FROM ufo_dw.bronze_ufo_sightings
+    UNION ALL SELECT 'Silver', 'silver_ufo_sightings', COUNT(*) FROM cctb_catalog.ufo_dw.silver_ufo_sightings
+    UNION ALL SELECT 'Gold',   'dim_date',             COUNT(*) FROM cctb_catalog.ufo_dw.dim_date
+    UNION ALL SELECT 'Gold',   'dim_time',             COUNT(*) FROM cctb_catalog.ufo_dw.dim_time
+    UNION ALL SELECT 'Gold',   'dim_location',         COUNT(*) FROM cctb_catalog.ufo_dw.dim_location
+    UNION ALL SELECT 'Gold',   'dim_ufo_shape',        COUNT(*) FROM cctb_catalog.ufo_dw.dim_ufo_shape
+    UNION ALL SELECT 'Gold',   'dim_duration',         COUNT(*) FROM cctb_catalog.ufo_dw.dim_duration
+    UNION ALL SELECT 'Gold',   'fact_sighting',        COUNT(*) FROM cctb_catalog.ufo_dw.fact_sighting
+    UNION ALL SELECT 'Gold',   'fact_monthly_agg',     COUNT(*) FROM cctb_catalog.ufo_dw.fact_monthly_agg
+    ORDER BY stage DESC, table_name
+""").display()
+
+# All orphan_rows values must equal 0
+# A non-zero result means a fact FK has no matching row in its dimension table
+spark.sql("""
+    SELECT 'date_key'     AS fk_column, COUNT(*) AS orphan_rows
+    FROM cctb_catalog.ufo_dw.fact_sighting f LEFT JOIN cctb_catalog.ufo_dw.dim_date d ON f.date_key = d.date_key
+    WHERE d.date_key IS NULL
+
+    UNION ALL
+    SELECT 'time_key', COUNT(*)
+    FROM cctb_catalog.ufo_dw.fact_sighting f LEFT JOIN cctb_catalog.ufo_dw.dim_time t ON f.time_key = t.time_key
+    WHERE t.time_key IS NULL
+
+    UNION ALL
+    SELECT 'location_key', COUNT(*)
+    FROM cctb_catalog.ufo_dw.fact_sighting f LEFT JOIN cctb_catalog.ufo_dw.dim_location l ON f.location_key = l.location_key
+    WHERE l.location_key IS NULL
+
+    UNION ALL
+    SELECT 'shape_key', COUNT(*)
+    FROM cctb_catalog.ufo_dw.fact_sighting f LEFT JOIN cctb_catalog.ufo_dw.dim_ufo_shape s ON f.shape_key = s.shape_key
+    WHERE s.shape_key IS NULL
+
+    UNION ALL
+    SELECT 'duration_key', COUNT(*)
+    FROM cctb_catalog.ufo_dw.fact_sighting f LEFT JOIN cctb_catalog.ufo_dw.dim_duration dur ON f.duration_key = dur.duration_key
+    WHERE dur.duration_key IS NULL
+""").display()
+
+spark.sql("""
+    SELECT
+        l.country,
+        l.region,
+        COUNT(*)                            AS total_sightings,
+        ROUND(AVG(f.duration_minutes), 1)   AS avg_duration_min
+    FROM cctb_catalog.ufo_dw.fact_sighting    f
+    JOIN cctb_catalog.ufo_dw.dim_location     l ON f.location_key = l.location_key
+    WHERE l.country IS NOT NULL
+    GROUP BY l.country, l.region
+    ORDER BY total_sightings DESC
+    LIMIT 20
+""").display()
+
+spark.sql("""
+    SELECT
+        d.decade,
+        COUNT(*)                             AS total_sightings,
+        COUNT(DISTINCT d.year)               AS years_with_data,
+        ROUND(COUNT(*) / COUNT(DISTINCT d.year), 0) AS avg_sightings_per_year
+    FROM cctb_catalog.ufo_dw.fact_sighting   f
+    JOIN cctb_catalog.ufo_dw.dim_date        d ON f.date_key = d.date_key
+    GROUP BY d.decade
+    ORDER BY d.decade
+""").display()
+
+spark.sql("""
+    SELECT
+        l.country,
+        s.shape_grouped,
+        COUNT(*) AS sightings,
+        -- Percentage within each country — uses a window function
+        ROUND(
+            100.0 * COUNT(*) / SUM(COUNT(*)) OVER (PARTITION BY l.country),
+            1
+        ) AS pct_in_country
+    FROM  cctb_catalog.ufo_dw.fact_sighting    f
+    JOIN  cctb_catalog.ufo_dw.dim_ufo_shape    s ON f.shape_key    = s.shape_key
+    JOIN  cctb_catalog.ufo_dw.dim_location     l ON f.location_key = l.location_key
+    WHERE l.country IS NOT NULL
+      AND s.shape_grouped <> 'Unknown'
+    GROUP BY l.country, s.shape_grouped
+    ORDER BY l.country, sightings DESC
+""").display(30, truncate=False)
+
+spark.sql("""
+    SELECT
+        d.season,
+        t.time_of_day,
+        COUNT(*)  AS sightings
+    FROM cctb_catalog.ufo_dw.fact_sighting   f
+    JOIN cctb_catalog.ufo_dw.dim_date        d ON f.date_key = d.date_key
+    JOIN cctb_catalog.ufo_dw.dim_time        t ON f.time_key = t.time_key
+    WHERE d.season IS NOT NULL
+    GROUP BY d.season, t.time_of_day
+    ORDER BY d.season, t.time_of_day
+""").display()
+
+spark.sql("""
+    SELECT
+        s.ufo_shape,
+        l.country,
+        COUNT(*)                            AS sightings,
+        ROUND(AVG(f.duration_minutes), 2)   AS avg_duration_min,
+        ROUND(MAX(f.duration_minutes), 2)   AS max_duration_min
+    FROM cctb_catalog.ufo_dw.fact_sighting   f
+    JOIN cctb_catalog.ufo_dw.dim_ufo_shape   s ON f.shape_key    = s.shape_key
+    JOIN cctb_catalog.ufo_dw.dim_location    l ON f.location_key = l.location_key
+    WHERE s.ufo_shape <> 'Unknown'
+      AND f.duration_minutes > 0
+    GROUP BY s.ufo_shape, l.country
+    HAVING COUNT(*) >= 10           -- exclude combinations with too few data points
+    ORDER BY avg_duration_min DESC
+    LIMIT 20
+""").display(truncate=False)
+
+spark.sql("""
+    SELECT
+        d.season,
+        l.is_usa,
+        COUNT(*)                            AS sightings,
+        ROUND(AVG(f.duration_minutes), 2)   AS avg_duration_min
+    FROM cctb_catalog.ufo_dw.fact_sighting   f
+    JOIN cctb_catalog.ufo_dw.dim_date        d ON f.date_key     = d.date_key
+    JOIN cctb_catalog.ufo_dw.dim_location    l ON f.location_key = l.location_key
+    WHERE d.season IS NOT NULL
+    GROUP BY d.season, l.is_usa
+    ORDER BY d.season, l.is_usa
+""").display()
+
+spark.sql("""
+    SELECT
+        d.year_month,
+        d.year,
+        d.month_name,
+        COUNT(*)                              AS sightings,
+        ROUND(AVG(f.duration_minutes), 1)     AS avg_duration_min
+    FROM cctb_catalog.ufo_dw.fact_sighting   f
+    JOIN cctb_catalog.ufo_dw.dim_date        d ON f.date_key = d.date_key
+    GROUP BY d.year_month, d.year, d.month_name
+    ORDER BY sightings DESC
+    LIMIT 10
+
+# Optimised query for the BI dashboard Executive Summary page
+# Uses fact_monthly_agg — much faster than scanning fact_sighting for high-level KPIs
+spark.sql("""
+    SELECT
+        f.year,
+        f.month_name,
+        f.quarter,
+        f.country,
+        f.is_usa,
+        f.shape_grouped,
+        d.season,
+        f.total_sightings,
+        f.avg_duration_min,
+        f.pct_night_sightings
+    FROM cctb_catalog.ufo_dw.fact_monthly_agg f
+    JOIN cctb_catalog.ufo_dw.dim_date d ON f.date_key = d.date_key
+    ORDER BY f.year, f.month, f.country
+""").display(10)
+
+print()
+print("Connect Power BI or Tableau to the Gold tables via Databricks JDBC:")
+print("  ufo_dw.fact_sighting       — detailed drill-through pages")
+print("  ufo_dw.fact_monthly_agg    — executive summary KPIs")
+print("  ufo_dw.dim_*               — dimension tables for slicers/filters")
